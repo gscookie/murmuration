@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "murmuration"
+version = "0.1.0"
+description = "Inter-agent communication channel MCP server — MongoDB-backed shared workspace for the flock"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "pymongo>=4.0.0",
+]
+
+[project.scripts]
+murmuration = "murmuration:main"
