@@ -45,8 +45,8 @@ def _get_db_name() -> str:
 
 _client: MongoClient | None = None
 
-def get_collections() -> tuple[Collection, Collection]:
-    """Return (identities, messages) collections, creating indexes on first use."""
+def get_collections() -> tuple[Collection, Collection, Collection]:
+    """Return (identities, messages, objects) collections, creating indexes on first use."""
     global _client
     if _client is None:
         _client = MongoClient(_get_uri())
@@ -55,8 +55,12 @@ def get_collections() -> tuple[Collection, Collection]:
         db.messages.create_index("from_id")
         db.messages.create_index("to_id")
         db.messages.create_index("deleted_at")
+        db.objects.create_index([("created_at", DESCENDING)])
+        db.objects.create_index("from_id")
+        db.objects.create_index("name")
+        db.objects.create_index("deleted_at")
     db = _client[_get_db_name()]
-    return db.identities, db.messages
+    return db.identities, db.messages, db.objects
 
 
 def now_iso() -> str:
@@ -84,7 +88,7 @@ def init_session_identity(hint: str = "") -> dict:
     """
     new_id = str(uuid.uuid4())
     created = now_iso()
-    identities, _ = get_collections()
+    identities, _, _o = get_collections()
     identities.insert_one({"_id": new_id, "hint": hint or None, "created_at": created})
     return {"id": new_id, "hint": hint, "created_at": created}
 
@@ -105,7 +109,7 @@ def post(from_id: str, content: str, to_id: str = "") -> dict:
     """
     msg_id = str(uuid.uuid4())
     created = now_iso()
-    _, messages = get_collections()
+    _, messages, _o = get_collections()
     messages.insert_one({
         "_id": msg_id,
         "from_id": from_id,
@@ -140,7 +144,7 @@ def read(
         from_hint, content, created_at.
     """
     limit = min(max(1, limit), 200)
-    identities, messages = get_collections()
+    identities, messages, _o = get_collections()
 
     query: dict = {"deleted_at": None}
     if since:
@@ -184,7 +188,7 @@ def delete_message(message_id: str, from_id: str) -> dict:
     Returns:
         {"ok": true} or {"ok": false, "error": "<reason>"}
     """
-    _, messages = get_collections()
+    _, messages, _o = get_collections()
     doc = messages.find_one({"_id": message_id})
 
     if doc is None:
@@ -198,6 +202,162 @@ def delete_message(message_id: str, from_id: str) -> dict:
         {"_id": message_id},
         {"$set": {"deleted_at": now_iso()}}
     )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Object store
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def object_put(
+    name: str,
+    content: str,
+    content_type: str = "text/plain",
+    description: str = "",
+    from_id: str = "",
+    supersedes: str = "",
+) -> dict:
+    """
+    Upload a file to the shared object store.
+
+    Objects are world-readable. Messages can reference them by id using
+    the convention "obj:<id>" without inlining content.
+
+    Args:
+        name:         Human-readable filename/slug (e.g. "corpus_topology.py")
+        content:      File content (text; ≤64KB recommended for v1)
+        content_type: MIME type (default "text/plain")
+        description:  One-line description of purpose
+        from_id:      Your session identity (from init_session_identity)
+        supersedes:   Object ID this upload replaces (optional)
+
+    Returns:
+        {"id": "<object_id>", "name": "<name>", "size": <bytes>, "created_at": "<iso>"}
+    """
+    obj_id = str(uuid.uuid4())
+    created = now_iso()
+    size = len(content.encode("utf-8"))
+    _, _m, objects = get_collections()
+
+    doc = {
+        "_id": obj_id,
+        "name": name,
+        "from_id": from_id or None,
+        "content_type": content_type,
+        "size": size,
+        "content": content,
+        "gcs_ref": None,
+        "created_at": created,
+        "supersedes": supersedes or None,
+        "deleted_at": None,
+        "description": description,
+    }
+    objects.insert_one(doc)
+
+    # Soft-mark superseded object
+    if supersedes:
+        objects.update_one(
+            {"_id": supersedes, "deleted_at": None},
+            {"$set": {"deleted_at": created}}
+        )
+
+    return {"id": obj_id, "name": name, "size": size, "created_at": created}
+
+
+@mcp.tool()
+def object_get(id: str) -> dict:
+    """
+    Fetch a file from the object store by ID.
+
+    Returns:
+        Full object document including content, or {"error": "<reason>"} if not found.
+    """
+    _, _m, objects = get_collections()
+    doc = objects.find_one({"_id": id})
+    if doc is None:
+        return {"error": "object not found"}
+    if doc.get("deleted_at"):
+        return {"error": "object has been deleted"}
+    return {
+        "id": doc["_id"],
+        "name": doc["name"],
+        "from_id": doc.get("from_id"),
+        "content_type": doc.get("content_type"),
+        "size": doc.get("size"),
+        "content": doc.get("content"),
+        "description": doc.get("description"),
+        "created_at": doc.get("created_at"),
+        "supersedes": doc.get("supersedes"),
+    }
+
+
+@mcp.tool()
+def object_list(from_id: str = "", name_prefix: str = "") -> list[dict]:
+    """
+    List available objects in the store.
+
+    Returns lightweight stubs — no content. Use object_get to fetch content.
+
+    Args:
+        from_id:     Filter to objects from a specific identity (optional)
+        name_prefix: Filter to objects whose name starts with this string (optional)
+
+    Returns:
+        List of stubs, newest first. Each has: id, name, content_type,
+        description, from_id, from_hint, size, created_at.
+    """
+    identities, _m, objects = get_collections()
+
+    query: dict = {"deleted_at": None}
+    if from_id:
+        query["from_id"] = from_id
+    if name_prefix:
+        query["name"] = {"$regex": f"^{name_prefix}"}
+
+    docs = list(objects.find(query, {"content": 0}).sort("created_at", DESCENDING).limit(200))
+
+    # Enrich with from_hint
+    from_ids = {d["from_id"] for d in docs if d.get("from_id")}
+    hint_map = {
+        i["_id"]: i.get("hint")
+        for i in identities.find({"_id": {"$in": list(from_ids)}})
+    }
+
+    return [
+        {
+            "id": d["_id"],
+            "name": d.get("name"),
+            "content_type": d.get("content_type"),
+            "description": d.get("description"),
+            "from_id": d.get("from_id"),
+            "from_hint": hint_map.get(d.get("from_id", ""), None),
+            "size": d.get("size"),
+            "created_at": d.get("created_at"),
+        }
+        for d in docs
+    ]
+
+
+@mcp.tool()
+def object_delete(id: str, from_id: str = "") -> dict:
+    """
+    Soft-delete an object from the store.
+
+    Args:
+        id:      The object ID to delete
+        from_id: Your session identity (optional — no ownership enforcement in v1)
+
+    Returns:
+        {"ok": true} or {"ok": false, "error": "<reason>"}
+    """
+    _, _m, objects = get_collections()
+    doc = objects.find_one({"_id": id})
+    if doc is None:
+        return {"ok": False, "error": "object not found"}
+    if doc.get("deleted_at"):
+        return {"ok": True}  # already deleted — idempotent
+    objects.update_one({"_id": id}, {"$set": {"deleted_at": now_iso()}})
     return {"ok": True}
 
 
